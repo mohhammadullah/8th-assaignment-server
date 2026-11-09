@@ -27,7 +27,7 @@ app.use(
 app.use(express.json());
 app.use(cookieParser());
 
-// MongoDB Connection
+
 const client = new MongoClient(process.env.MONGODB_URI);
 
 async function connectToMongoDB() {
@@ -42,8 +42,7 @@ async function connectToMongoDB() {
       { unique: true, name: "uniq_user_studio" }
     );
 
-    // Enforce no-double-booking at the DB level (atomic vs. races).
-    // Cancelled bookings are excluded so a freed slot can be re-booked.
+ 
     const activeOnly = { status: { $ne: "Cancelled" } };
     try {
       await app.locals.bookingsCollection.createIndex(
@@ -55,8 +54,7 @@ async function connectToMongoDB() {
         { unique: true, partialFilterExpression: activeOnly, name: "uniq_user_date_slot" }
       );
     } catch (indexError) {
-      // Duplicate legacy data may block index creation — the app-level
-      // checks still prevent new conflicts, but dedupe bookings to fix.
+
       console.warn("Booking index creation failed:", indexError.message);
     }
 
@@ -69,14 +67,13 @@ async function connectToMongoDB() {
 
 connectToMongoDB();
 
-// 🔑 Auth middleware — cookie-based (reads the HTTPOnly `token` cookie).
-// Kept as `verifyToken` so the studio routes below need no other changes.
+
 const verifyToken = (req, res, next) => {
   const cookieToken = req.cookies?.token;
   if (cookieToken) {
     return verifyTokenCookie(req, res, next);
   }
-  // Legacy fallback for old Bearer clients.
+ 
   const authHeader = req.headers.authorization;
   const token = authHeader && authHeader.split(" ")[1];
   if (!token) {
@@ -96,7 +93,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/bookings", bookingRoutes);
 app.use("/api/wishlist", wishlistRoutes);
 
-// Featured & Special Routes (MUST be defined before /:id)
+
 app.get("/api/studios/featured", async (req, res) => {
   try {
     const studiosCollection = client.db("studio-space").collection("studios");
@@ -147,7 +144,7 @@ app.get("/api/studios", async (req, res) => {
   }
 });
 
-// Create Studio Route (Protected with Bearer Token)
+
 app.post("/api/studios", verifyToken, async (req, res) => {
   try {
     const studioData = req.body;
@@ -171,7 +168,7 @@ app.post("/api/studios", verifyToken, async (req, res) => {
   }
 });
 
-// Dynamic Routes
+
 app.get("/api/studios/:id", async (req, res) => {
   try {
     const id = req.params.id;

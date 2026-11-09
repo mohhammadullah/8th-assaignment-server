@@ -7,7 +7,7 @@ function collections(req) {
   };
 }
 
-/** GET /api/wishlist — the logged-in user's saved studios (full docs). */
+
 export const listWishlist = async (req, res) => {
   try {
     const { wishlist, studios } = collections(req);
@@ -32,7 +32,6 @@ export const listWishlist = async (req, res) => {
       .find({ _id: { $in: ids.map((id) => new ObjectId(id)) } })
       .toArray();
 
-    // Keep wishlist order, drop any stale entries for deleted studios.
     const byId = new Map(studioDocs.map((s) => [String(s._id), s]));
     const ordered = ids.map((id) => byId.get(id)).filter(Boolean);
 
@@ -43,7 +42,7 @@ export const listWishlist = async (req, res) => {
   }
 };
 
-/** GET /api/wishlist/check?studioId= — { saved: boolean } */
+
 export const checkWishlist = async (req, res) => {
   try {
     const { studioId } = req.query;
@@ -67,7 +66,7 @@ export const checkWishlist = async (req, res) => {
   }
 };
 
-/** POST /api/wishlist { studioId } — save a studio (idempotent). */
+
 export const addToWishlist = async (req, res) => {
   try {
     const { studioId } = req.body || {};
@@ -110,7 +109,7 @@ export const addToWishlist = async (req, res) => {
   }
 };
 
-/** DELETE /api/wishlist/:studioId — remove a saved studio. */
+
 export const removeFromWishlist = async (req, res) => {
   try {
     const { wishlist } = collections(req);

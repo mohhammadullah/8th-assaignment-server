@@ -10,18 +10,14 @@ const googleClientId = () => process.env["GOOGLE_CLIENT_ID"];
 function issueSessionCookie(res, token) {
   res.cookie("token", token, {
     httpOnly: true,
-    secure: false, // local dev over http; set true only behind https
+    secure: false,
     sameSite: "lax",
     path: "/",
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    maxAge: 7 * 24 * 60 * 60 * 1000, 
   });
 }
 
-/**
- * POST /api/auth/google
- * Verifies a Google ID token, upserts the user, and sets the same
- * HTTPOnly `token` cookie used by email/password auth.
- */
+
 export const googleUser = async (req, res) => {
   try {
     const { credential } = req.body || {};
@@ -112,16 +108,16 @@ export const registerUser = async (req, res) => {
 
     res.cookie("token", token, {
       httpOnly: true,
-      secure: false, // local dev over http; set true only behind https
+      secure: false, 
       sameSite: "lax",
       path: "/",
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
     res.status(201).json({
       success: true,
       message: "User registered successfully",
-      token, // kept for backward compatibility; the cookie is the source of truth
+      token, 
       user: { id: result.insertedId, name, email, photoUrl },
     });
   } catch (error) {
@@ -154,16 +150,16 @@ export const loginUser = async (req, res) => {
 
     res.cookie("token", token, {
       httpOnly: true,
-      secure: false, // local dev over http; set true only behind https
+      secure: false, 
       sameSite: "lax",
       path: "/",
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
     res.status(200).json({
       success: true,
       message: "Login successful",
-      token, // kept for backward compatibility; the cookie is the source of truth
+      token,
       user: { id: user._id, name: user.name, email: user.email, photoUrl: user.photoUrl },
     });
   } catch (error) {
@@ -172,11 +168,11 @@ export const loginUser = async (req, res) => {
   }
 };
 
-/** Get currently authenticated user (getMe) — reads the HTTPOnly `token` cookie */
+
 export const getMe = async (req, res) => {
   try {
     const authHeader = req.headers.authorization;
-    // Cookie first (the supported flow); Bearer only as a legacy fallback.
+    
     const token = req.cookies?.token || (authHeader && authHeader.split(" ")[1]);
 
     if (!token) {
@@ -209,7 +205,7 @@ export const getMe = async (req, res) => {
   }
 };
 
-/** Logout user */
+
 export const logoutUser = async (req, res) => {
   try {
     res.clearCookie("token", {

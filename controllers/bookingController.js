@@ -1,9 +1,6 @@
 import { ObjectId } from "mongodb";
 
-/**
- * Parse a slot like "09:00-11:00" into minutes past midnight.
- * Returns { start, end } or null when it isn't a valid range.
- */
+
 function parseTimeSlot(slot) {
   const match = /^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/.exec(
     String(slot).trim()
@@ -15,10 +12,6 @@ function parseTimeSlot(slot) {
   return { start, end };
 }
 
-/**
- * True when two slots intersect. Back-to-back slots are fine:
- * 09:00-11:00 and 11:00-13:00 do NOT overlap.
- */
 function slotsOverlap(a, b) {
   const rangeA = parseTimeSlot(a);
   const rangeB = parseTimeSlot(b);
@@ -28,7 +21,7 @@ function slotsOverlap(a, b) {
   return rangeA.start < rangeB.end && rangeB.start < rangeA.end;
 }
 
-/** Create a new booking for the authenticated user */
+
 export const createBooking = async (req, res) => {
   try {
     const { studioId, studioName, date, timeSlot, price } = req.body || {};
@@ -51,7 +44,7 @@ export const createBooking = async (req, res) => {
     }
 
     const studioIdStr = String(studioId);
-    const dateStr = String(date).trim().slice(0, 10); // YYYY-MM-DD from <input type="date">
+    const dateStr = String(date).trim().slice(0, 10);
     const timeSlotStr = String(timeSlot).trim();
 
     if (!parseTimeSlot(timeSlotStr)) {
@@ -61,8 +54,6 @@ export const createBooking = async (req, res) => {
       });
     }
 
-    // 1) No overlapping slot on this studio + date, for anyone.
-    //    Exact-match alone wouldn't stop 10:00-12:00 vs an existing 09:00-11:00.
     const studioBookingsOnDate = await bookingsCollection
       .find({
         studioId: studioIdStr,
@@ -79,7 +70,6 @@ export const createBooking = async (req, res) => {
       });
     }
 
-    // 2) Same user can't hold two bookings (any studio) with overlapping slots.
     const userBookingsOnDate = await bookingsCollection
       .find({
         userId: req.user.userId,
@@ -115,7 +105,7 @@ export const createBooking = async (req, res) => {
         bookingId: result.insertedId,
       });
     } catch (insertError) {
-      // Unique-index race: two requests passed the check simultaneously.
+   
       if (insertError.code === 11000) {
         return res.status(400).json({
           success: false,
@@ -130,7 +120,6 @@ export const createBooking = async (req, res) => {
   }
 };
 
-/** Get all bookings for the logged-in user */
 export const getMyBookings = async (req, res) => {
   try {
     const bookingsCollection = req.app.locals.bookingsCollection;
@@ -154,11 +143,7 @@ export const getMyBookings = async (req, res) => {
   }
 };
 
-/**
- * GET /api/bookings/slots?studioId=&date=YYYY-MM-DD
- * Returns the time slots already taken for a studio on a date,
- * so the booking form can disable them in the UI.
- */
+
 export const getBookedSlots = async (req, res) => {
   try {
     const { studioId, date } = req.query;
@@ -199,7 +184,7 @@ export const getBookedSlots = async (req, res) => {
   }
 };
 
-/** Delete a booking by ID */
+
 export const deleteBooking = async (req, res) => {
   try {
     const { id } = req.params;
@@ -216,7 +201,7 @@ export const deleteBooking = async (req, res) => {
 
     const result = await bookingsCollection.deleteOne({
       _id: new ObjectId(id),
-      userId: req.user.userId, // Only allow owner to delete
+      userId: req.user.userId, 
     });
 
     if (result.deletedCount === 0) {
