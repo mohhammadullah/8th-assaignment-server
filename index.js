@@ -7,6 +7,7 @@ import cookieParser from "cookie-parser";
 import { MongoClient, ObjectId } from "mongodb";
 import authRoutes from "./routes/authRoutes.js";
 import bookingRoutes from "./routes/bookingRoutes.js";
+import wishlistRoutes from "./routes/wishlistRoutes.js";
 import { verifyTokenCookie } from "./middleware/authMiddleware.js";
 
 dotenv.config();
@@ -35,6 +36,11 @@ async function connectToMongoDB() {
     app.locals.usersCollection = client.db("studio-space").collection("users");
     app.locals.bookingsCollection = client.db("studio-space").collection("bookings");
     app.locals.studiosCollection = client.db("studio-space").collection("studios");
+    app.locals.wishlistCollection = client.db("studio-space").collection("wishlist");
+    await app.locals.wishlistCollection.createIndex(
+      { userId: 1, studioId: 1 },
+      { unique: true, name: "uniq_user_studio" }
+    );
 
     // Enforce no-double-booking at the DB level (atomic vs. races).
     // Cancelled bookings are excluded so a freed slot can be re-booked.
@@ -88,6 +94,7 @@ const verifyToken = (req, res, next) => {
 // Routes
 app.use("/api/auth", authRoutes);
 app.use("/api/bookings", bookingRoutes);
+app.use("/api/wishlist", wishlistRoutes);
 
 // Featured & Special Routes (MUST be defined before /:id)
 app.get("/api/studios/featured", async (req, res) => {
