@@ -1,8 +1,87 @@
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { OAuth2Client } from "google-auth-library";
 import { ObjectId } from "mongodb";
 
-const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key";
+// Read lazily: this module is imported before dotenv.config() runs in index.js.
+const jwtSecret = () => process.env["JWT_SECRET"] || "your_jwt_secret_key";
+const googleClientId = () => process.env["GOOGLE_CLIENT_ID"];
+
+function issueSessionCookie(res, token) {
+  res.cookie("token", token, {
+    httpOnly: true,
+    secure: false, // local dev over http; set true only behind https
+    sameSite: "lax",
+    path: "/",
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+  });
+}
+
+/**
+ * POST /api/auth/google
+ * Verifies a Google ID token, upserts the user, and sets the same
+ * HTTPOnly `token` cookie used by email/password auth.
+ */
+export const googleUser = async (req, res) => {
+  try {
+    const { credential } = req.body || {};
+    if (!credential) {
+      return res.status(400).json({ success: false, message: "Google credential is required" });
+    }
+    if (!googleClientId()) {
+      return res.status(500).json({ success: false, message: "Google client not configured on server" });
+    }
+
+    const oauthClient = new OAuth2Client(googleClientId());
+    const ticket = await oauthClient.verifyIdToken({
+      idToken: credential,
+      audience: googleClientId(),
+    });
+    const payload = ticket.getPayload();
+
+    const email = payload.email;
+    const name = payload.name || payload.given_name || "";
+    const picture = payload.picture || "";
+
+    if (!email) {
+      return res.status(400).json({ success: false, message: "Google account has no email" });
+    }
+    if (payload.email_verified === false) {
+      return res.status(401).json({ success: false, message: "Google email is not verified" });
+    }
+
+    const usersCollection = req.app.locals.usersCollection;
+    if (!usersCollection) {
+      return res.status(500).json({ success: false, message: "Users collection not initialized" });
+    }
+
+    let user = await usersCollection.findOne({ email });
+    if (!user) {
+      const result = await usersCollection.insertOne({
+        name,
+        email,
+        photoUrl: picture,
+        createdAt: new Date(),
+      });
+      user = await usersCollection.findOne({ _id: result.insertedId });
+    } else if (!user.photoUrl && picture) {
+      await usersCollection.updateOne({ _id: user._id }, { $set: { photoUrl: picture } });
+      user.photoUrl = picture;
+    }
+
+    const token = jwt.sign({ id: user._id, email: user.email }, jwtSecret(), { expiresIn: "7d" });
+    issueSessionCookie(res, token);
+
+    return res.status(200).json({
+      success: true,
+      message: "Google sign-in successful",
+      user: { id: user._id, name: user.name, email: user.email, photoUrl: user.photoUrl },
+    });
+  } catch (error) {
+    console.error("Google Auth Error:", error?.message || error);
+    return res.status(401).json({ success: false, message: "Invalid Google token" });
+  }
+};
 
 /** Register a new user */
 export const registerUser = async (req, res) => {
@@ -29,7 +108,7 @@ export const registerUser = async (req, res) => {
       createdAt: new Date(),
     });
 
-    const token = jwt.sign({ id: result.insertedId, email }, JWT_SECRET, { expiresIn: "7d" });
+    const token = jwt.sign({ id: result.insertedId, email }, jwtSecret(), { expiresIn: "7d" });
 
     res.cookie("token", token, {
       httpOnly: true,
@@ -71,7 +150,7 @@ export const loginUser = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid email or password" });
     }
 
-    const token = jwt.sign({ id: user._id, email: user.email }, JWT_SECRET, { expiresIn: "7d" });
+    const token = jwt.sign({ id: user._id, email: user.email }, jwtSecret(), { expiresIn: "7d" });
 
     res.cookie("token", token, {
       httpOnly: true,
@@ -104,7 +183,7 @@ export const getMe = async (req, res) => {
       return res.status(401).json({ success: false, message: "Not authenticated" });
     }
 
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, jwtSecret());
     const usersCollection = req.app.locals.usersCollection;
 
     if (!usersCollection) {

@@ -1,6 +1,7 @@
 import jwt from "jsonwebtoken";
 
-const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key";
+// Read lazily: this module is imported before dotenv.config() runs in index.js.
+const jwtSecret = () => process.env["JWT_SECRET"] || "your_jwt_secret_key";
 
 export const verifyTokenCookie = (req, res, next) => {
   const token = req.cookies?.token;
@@ -9,7 +10,7 @@ export const verifyTokenCookie = (req, res, next) => {
     return res.status(401).json({ success: false, message: "Unauthorized access: No token provided!" });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+  jwt.verify(token, jwtSecret(), (err, decoded) => {
     if (err) {
       return res.status(401).json({ success: false, message: "Unauthorized: Invalid or expired token!" });
     }
