@@ -1,34 +1,40 @@
 import express from "express";
-import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
 import cors from "cors";
 import cookieParser from "cookie-parser";
-import { MongoClient, ObjectId } from "mongodb";
-import authRoutes from "./routes/authRoutes.js";
+import { ObjectId } from "mongodb";
+import { toNodeHandler } from "better-auth/node";
+import { auth } from "./lib/auth.js";
+import { getMongoClient } from "./lib/database.js";
 import bookingRoutes from "./routes/bookingRoutes.js";
 import wishlistRoutes from "./routes/wishlistRoutes.js";
-import { verifyTokenCookie } from "./middleware/authMiddleware.js";
+import { verifyAuth } from "./middleware/authMiddleware.js";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key";
 
-// CORS Configuration
+// CORS: only the frontend origin(s) may call the API with credentials.
+const frontendOrigin = process.env.FRONTEND_URL || "http://localhost:3000";
 app.use(
   cors({
-    origin: "http://localhost:3000",
+    origin: [...new Set([frontendOrigin, "http://localhost:3000"])],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true,
   })
 );
 
+// Better Auth owns /api/auth/*. Mounted BEFORE express.json() so the auth
+// handler receives the raw request body, and with CORS already applied so
+// the browser allows the session cookie to be set on cross-origin responses.
+app.all("/api/auth/{*any}", toNodeHandler(auth));
+
 app.use(express.json());
 app.use(cookieParser());
 
-
-const client = new MongoClient(process.env.MONGODB_URI);
+const client = getMongoClient();
 
 async function connectToMongoDB() {
   try {
@@ -42,7 +48,6 @@ async function connectToMongoDB() {
       { unique: true, name: "uniq_user_studio" }
     );
 
- 
     const activeOnly = { status: { $ne: "Cancelled" } };
     try {
       await app.locals.bookingsCollection.createIndex(
@@ -54,7 +59,6 @@ async function connectToMongoDB() {
         { unique: true, partialFilterExpression: activeOnly, name: "uniq_user_date_slot" }
       );
     } catch (indexError) {
-
       console.warn("Booking index creation failed:", indexError.message);
     }
 
@@ -67,32 +71,9 @@ async function connectToMongoDB() {
 
 connectToMongoDB();
 
-
-const verifyToken = (req, res, next) => {
-  const cookieToken = req.cookies?.token;
-  if (cookieToken) {
-    return verifyTokenCookie(req, res, next);
-  }
- 
-  const authHeader = req.headers.authorization;
-  const token = authHeader && authHeader.split(" ")[1];
-  if (!token) {
-    return res.status(401).json({ success: false, message: "Unauthorized: No token provided!" });
-  }
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) {
-      return res.status(401).json({ success: false, message: "Unauthorized: Invalid or expired token!" });
-    }
-    req.user = { ...decoded, userId: decoded.id };
-    next();
-  });
-};
-
 // Routes
-app.use("/api/auth", authRoutes);
 app.use("/api/bookings", bookingRoutes);
 app.use("/api/wishlist", wishlistRoutes);
-
 
 app.get("/api/studios/featured", async (req, res) => {
   try {
@@ -108,9 +89,18 @@ app.get("/api/studios/featured", async (req, res) => {
   }
 });
 
-app.get("/api/studios/user/:email", async (req, res) => {
+app.get("/api/studios/user/:email", verifyAuth, async (req, res) => {
   try {
-    const email = req.params.email;
+    const email = decodeURIComponent(req.params.email);
+
+    // Only the authenticated user may list their own studios.
+    if (email.toLowerCase() !== req.user.email.toLowerCase()) {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: cannot access another user's listings",
+      });
+    }
+
     const studiosCollection = client.db("studio-space").collection("studios");
     const studios = await studiosCollection.find({ ownerEmail: email }).toArray();
     res.status(200).json(studios);
@@ -144,10 +134,10 @@ app.get("/api/studios", async (req, res) => {
   }
 });
 
-
-app.post("/api/studios", verifyToken, async (req, res) => {
+app.post("/api/studios", verifyAuth, async (req, res) => {
   try {
-    const studioData = req.body;
+    // Never trust ownership or identity fields supplied by the client.
+    const { ownerEmail, _id, createdAt, ...studioData } = req.body || {};
     const studiosCollection = client.db("studio-space").collection("studios");
 
     const result = await studiosCollection.insertOne({
@@ -168,7 +158,6 @@ app.post("/api/studios", verifyToken, async (req, res) => {
   }
 });
 
-
 app.get("/api/studios/:id", async (req, res) => {
   try {
     const id = req.params.id;
@@ -186,16 +175,45 @@ app.get("/api/studios/:id", async (req, res) => {
   }
 });
 
-app.put("/api/studios/:id", verifyToken, async (req, res) => {
+async function findOwnStudio(req, res) {
+  const studiosCollection = client.db("studio-space").collection("studios");
+  const studio = await studiosCollection.findOne({
+    _id: new ObjectId(req.params.id),
+  });
+
+  if (!studio) {
+    res.status(404).json({ success: false, message: "Studio not found" });
+    return null;
+  }
+
+  if (
+    !studio.ownerEmail ||
+    studio.ownerEmail.toLowerCase() !== req.user.email.toLowerCase()
+  ) {
+    res.status(403).json({
+      success: false,
+      message: "Forbidden: you do not own this studio",
+    });
+    return null;
+  }
+
+  return { studiosCollection, studio };
+}
+
+app.put("/api/studios/:id", verifyAuth, async (req, res) => {
   try {
     const id = req.params.id;
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ message: "Invalid studio ID format" });
     }
-    const updatedData = req.body;
-    const studiosCollection = client.db("studio-space").collection("studios");
 
-    await studiosCollection.updateOne(
+    const owned = await findOwnStudio(req, res);
+    if (!owned) return;
+
+    // Never allow ownership or identity fields to be overwritten.
+    const { ownerEmail, _id, createdAt, ...updatedData } = req.body || {};
+
+    await owned.studiosCollection.updateOne(
       { _id: new ObjectId(id) },
       { $set: updatedData }
     );
@@ -206,14 +224,17 @@ app.put("/api/studios/:id", verifyToken, async (req, res) => {
   }
 });
 
-app.delete("/api/studios/:id", verifyToken, async (req, res) => {
+app.delete("/api/studios/:id", verifyAuth, async (req, res) => {
   try {
     const id = req.params.id;
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ message: "Invalid studio ID format" });
     }
-    const studiosCollection = client.db("studio-space").collection("studios");
-    await studiosCollection.deleteOne({ _id: new ObjectId(id) });
+
+    const owned = await findOwnStudio(req, res);
+    if (!owned) return;
+
+    await owned.studiosCollection.deleteOne({ _id: new ObjectId(id) });
     res.status(200).json({ success: true, message: "Studio deleted successfully!" });
   } catch (error) {
     res.status(500).json({ message: "Failed to delete studio" });
@@ -223,3 +244,5 @@ app.delete("/api/studios/:id", verifyToken, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
+
+export default app;
