@@ -35,6 +35,25 @@ async function connectToMongoDB() {
     app.locals.usersCollection = client.db("studio-space").collection("users");
     app.locals.bookingsCollection = client.db("studio-space").collection("bookings");
     app.locals.studiosCollection = client.db("studio-space").collection("studios");
+
+    // Enforce no-double-booking at the DB level (atomic vs. races).
+    // Cancelled bookings are excluded so a freed slot can be re-booked.
+    const activeOnly = { status: { $ne: "Cancelled" } };
+    try {
+      await app.locals.bookingsCollection.createIndex(
+        { studioId: 1, date: 1, timeSlot: 1 },
+        { unique: true, partialFilterExpression: activeOnly, name: "uniq_studio_date_slot" }
+      );
+      await app.locals.bookingsCollection.createIndex(
+        { userId: 1, date: 1, timeSlot: 1 },
+        { unique: true, partialFilterExpression: activeOnly, name: "uniq_user_date_slot" }
+      );
+    } catch (indexError) {
+      // Duplicate legacy data may block index creation — the app-level
+      // checks still prevent new conflicts, but dedupe bookings to fix.
+      console.warn("Booking index creation failed:", indexError.message);
+    }
+
     console.log("Successfully connected to MongoDB!");
   } catch (error) {
     console.error("MongoDB connection failed:", error);
