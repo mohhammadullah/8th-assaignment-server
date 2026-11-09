@@ -3,24 +3,38 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import dotenv from "dotenv";
 import cors from "cors";
+import cookieParser from "cookie-parser";
 import { MongoClient, ObjectId } from "mongodb";
 import authRoutes from "./routes/authRoutes.js";
+import bookingRoutes from "./routes/bookingRoutes.js";
+import { verifyTokenCookie } from "./middleware/authMiddleware.js";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_key";
 
-app.use(cors());
+// CORS Configuration
+app.use(
+  cors({
+    origin: "http://localhost:3000",
+    credentials: true,
+  })
+);
+
 app.use(express.json());
-app.use("/api/auth", authRoutes);
+app.use(cookieParser());
 
+// MongoDB Connection
 const client = new MongoClient(process.env.MONGODB_URI);
 
 async function connectToMongoDB() {
   try {
     await client.connect();
     app.locals.usersCollection = client.db("studio-space").collection("users");
+    app.locals.bookingsCollection = client.db("studio-space").collection("bookings");
+    app.locals.studiosCollection = client.db("studio-space").collection("studios");
     console.log("Successfully connected to MongoDB!");
   } catch (error) {
     console.error("MongoDB connection failed:", error);
@@ -30,45 +44,33 @@ async function connectToMongoDB() {
 
 connectToMongoDB();
 
-app.get("/", (req, res) => {
-  res.send("StudioSpace Server is Running!");
-});
-
-const handleAddStudio = async (req, res) => {
-  try {
-    const studioData = req.body;
-    const studiosCollection = client.db("studio-space").collection("studios");
-    const result = await studiosCollection.insertOne({
-      ...studioData,
-      createdAt: new Date(),
-    });
-
-    res.status(201).json({
-      success: true,
-      message: "Studio listed successfully!",
-      insertedId: result.insertedId,
-      studioData,
-    });
-  } catch (error) {
-    console.error("Add Studio Error:", error);
-    res.status(500).json({ success: false, message: "Failed to submit studio" });
+// 🔑 Auth middleware — cookie-based (reads the HTTPOnly `token` cookie).
+// Kept as `verifyToken` so the studio routes below need no other changes.
+const verifyToken = (req, res, next) => {
+  const cookieToken = req.cookies?.token;
+  if (cookieToken) {
+    return verifyTokenCookie(req, res, next);
   }
+  // Legacy fallback for old Bearer clients.
+  const authHeader = req.headers.authorization;
+  const token = authHeader && authHeader.split(" ")[1];
+  if (!token) {
+    return res.status(401).json({ success: false, message: "Unauthorized: No token provided!" });
+  }
+  jwt.verify(token, JWT_SECRET, (err, decoded) => {
+    if (err) {
+      return res.status(401).json({ success: false, message: "Unauthorized: Invalid or expired token!" });
+    }
+    req.user = { ...decoded, userId: decoded.id };
+    next();
+  });
 };
 
-app.post("/api/studios", handleAddStudio);
-app.post("/add-studio", handleAddStudio);
+// Routes
+app.use("/api/auth", authRoutes);
+app.use("/api/bookings", bookingRoutes);
 
-app.get("/api/categories", async (req, res) => {
-  try {
-    const studiosCollection = client.db("studio-space").collection("studios");
-    const categories = await studiosCollection.distinct("category");
-    res.status(200).json(categories);
-  } catch (error) {
-    console.error("Fetch Categories Error:", error);
-    res.status(500).json({ message: "Failed to fetch categories" });
-  }
-});
-
+// Featured & Special Routes (MUST be defined before /:id)
 app.get("/api/studios/featured", async (req, res) => {
   try {
     const studiosCollection = client.db("studio-space").collection("studios");
@@ -94,6 +96,16 @@ app.get("/api/studios/user/:email", async (req, res) => {
   }
 });
 
+app.get("/api/categories", async (req, res) => {
+  try {
+    const studiosCollection = client.db("studio-space").collection("studios");
+    const categories = await studiosCollection.distinct("category");
+    res.status(200).json(categories);
+  } catch (error) {
+    res.status(500).json({ message: "Failed to fetch categories" });
+  }
+});
+
 app.get("/api/studios", async (req, res) => {
   try {
     const { category } = req.query;
@@ -109,6 +121,31 @@ app.get("/api/studios", async (req, res) => {
   }
 });
 
+// Create Studio Route (Protected with Bearer Token)
+app.post("/api/studios", verifyToken, async (req, res) => {
+  try {
+    const studioData = req.body;
+    const studiosCollection = client.db("studio-space").collection("studios");
+
+    const result = await studiosCollection.insertOne({
+      ...studioData,
+      ownerEmail: req.user.email,
+      createdAt: new Date(),
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Studio listed successfully!",
+      insertedId: result.insertedId,
+      studioData: { ...studioData, ownerEmail: req.user.email },
+    });
+  } catch (error) {
+    console.error("Add Studio Error:", error);
+    res.status(500).json({ success: false, message: "Failed to submit studio" });
+  }
+});
+
+// Dynamic Routes
 app.get("/api/studios/:id", async (req, res) => {
   try {
     const id = req.params.id;
@@ -118,7 +155,7 @@ app.get("/api/studios/:id", async (req, res) => {
     const studiosCollection = client.db("studio-space").collection("studios");
     const studio = await studiosCollection.findOne({ _id: new ObjectId(id) });
     if (!studio) {
-      return res.status(404).json({ message: "Studio not found" });
+      return res.status(400).json({ message: "Studio not found" });
     }
     res.status(200).json(studio);
   } catch (error) {
@@ -126,7 +163,7 @@ app.get("/api/studios/:id", async (req, res) => {
   }
 });
 
-app.put("/api/studios/:id", async (req, res) => {
+app.put("/api/studios/:id", verifyToken, async (req, res) => {
   try {
     const id = req.params.id;
     if (!ObjectId.isValid(id)) {
@@ -134,7 +171,7 @@ app.put("/api/studios/:id", async (req, res) => {
     }
     const updatedData = req.body;
     const studiosCollection = client.db("studio-space").collection("studios");
-    
+
     await studiosCollection.updateOne(
       { _id: new ObjectId(id) },
       { $set: updatedData }
@@ -146,7 +183,7 @@ app.put("/api/studios/:id", async (req, res) => {
   }
 });
 
-app.delete("/api/studios/:id", async (req, res) => {
+app.delete("/api/studios/:id", verifyToken, async (req, res) => {
   try {
     const id = req.params.id;
     if (!ObjectId.isValid(id)) {
@@ -157,52 +194,6 @@ app.delete("/api/studios/:id", async (req, res) => {
     res.status(200).json({ success: true, message: "Studio deleted successfully!" });
   } catch (error) {
     res.status(500).json({ message: "Failed to delete studio" });
-  }
-});
-
-app.post("/api/bookings", async (req, res) => {
-  try {
-    const bookingData = req.body;
-    const bookingsCollection = client.db("studio-space").collection("bookings");
-    
-    const newBooking = {
-      ...bookingData,
-      status: "Pending",
-      createdAt: new Date(),
-    };
-
-    const result = await bookingsCollection.insertOne(newBooking);
-    res.status(201).json({ success: true, message: "Studio booked successfully!", bookingId: result.insertedId });
-  } catch (error) {
-    res.status(500).json({ message: "Booking failed" });
-  }
-});
-
-app.get("/api/bookings/:email", async (req, res) => {
-  try {
-    const email = req.params.email;
-    const bookingsCollection = client.db("studio-space").collection("bookings");
-    const bookings = await bookingsCollection.find({ userEmail: email }).toArray();
-    res.status(200).json(bookings);
-  } catch (error) {
-    res.status(500).json({ message: "Failed to fetch bookings" });
-  }
-});
-
-app.patch("/api/bookings/:id/cancel", async (req, res) => {
-  try {
-    const id = req.params.id;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ message: "Invalid booking ID format" });
-    }
-    const bookingsCollection = client.db("studio-space").collection("bookings");
-    await bookingsCollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: { status: "Cancelled" } }
-    );
-    res.status(200).json({ success: true, message: "Booking cancelled successfully!" });
-  } catch (error) {
-    res.status(500).json({ message: "Failed to cancel booking" });
   }
 });
 
