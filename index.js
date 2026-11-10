@@ -2,23 +2,36 @@ import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
 import cookieParser from "cookie-parser";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { ObjectId } from "mongodb";
 import { toNodeHandler } from "better-auth/node";
+
+import { validateEnv } from "./lib/env.js";
 import { auth, getAllowedOrigins } from "./lib/auth.js";
-import { getMongoClient, getDbName } from "./lib/database.js";
+import { getMongoClient, getDbName, logMongoConnectionFailure } from "./lib/database.js";
+import { mongoSanitizeMiddleware } from "./lib/sanitize.js";
+import { csrfAndOriginProtection } from "./lib/csrf.js";
 import bookingRoutes from "./routes/bookingRoutes.js";
 import wishlistRoutes from "./routes/wishlistRoutes.js";
+import authTokenRoutes from "./routes/authTokenRoutes.js";
 import { verifyAuth } from "./middleware/authMiddleware.js";
+import { z } from "zod";
 
 dotenv.config();
+const env = validateEnv();
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+app.set("trust proxy", 1);
+const PORT = env.port;
 
-// CORS: only the frontend origin(s) may call the API with credentials.
-// FRONTEND_URL may be a comma-separated list; localhost is always allowed
-// for development so a fresh deploy works before env is updated.
 const allowedOrigins = getAllowedOrigins();
+app.use(
+  helmet({
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  })
+);
+
 app.use(
   cors({
     origin: (origin, callback) => {
@@ -28,76 +41,112 @@ app.use(
       return callback(new Error(`Origin ${origin} not allowed by CORS`));
     },
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-CSRF-Token"],
     credentials: true,
   })
 );
 
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 60,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { success: false, message: "Too many authentication requests" },
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 300,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { success: false, message: "Too many requests" },
+});
+
 // Better Auth owns /api/auth/*. Mounted BEFORE express.json() so the auth
-// handler receives the raw request body, and with CORS already applied so
-// the browser allows the session cookie to be set on cross-origin responses.
+// handler receives the raw request body. CORS already applied.
+app.use("/api/auth", authLimiter);
 app.all("/api/auth/{*any}", toNodeHandler(auth));
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "100kb" }));
+app.use(express.urlencoded({ extended: false, limit: "100kb" }));
 app.use(cookieParser());
+app.use(mongoSanitizeMiddleware);
+app.use("/api", apiLimiter);
+
+// JWT access-token issuance/clear endpoints (derived from verified Better Auth session).
+// Mounted on a separate namespace to avoid conflicts with Better Auth's /api/auth/* handler.
+app.use("/api/session", authLimiter, authTokenRoutes);
 
 const client = getMongoClient();
 const dbName = getDbName();
 let mongoReady = null;
+
+async function ensureIndexes(db) {
+  const studios = db.collection("studios");
+  const bookings = db.collection("bookings");
+  const wishlist = db.collection("wishlist");
+
+  const activeOnly = { status: { $in: ["Pending", "Confirmed"] } };
+
+  try {
+    await wishlist.createIndex(
+      { userId: 1, studioId: 1 },
+      { unique: true, name: "uniq_user_studio" }
+    );
+  } catch (error) {
+    console.warn("Wishlist index creation failed:", error.message);
+  }
+
+  try {
+    await studios.createIndex({ ownerEmail: 1, createdAt: -1 });
+    await studios.createIndex({ category: 1 });
+  } catch (error) {
+    console.warn("Studio index creation failed:", error.message);
+  }
+
+  try {
+    await bookings.createIndex(
+      { studioId: 1, date: 1, timeSlot: 1 },
+      { unique: true, partialFilterExpression: activeOnly, name: "uniq_studio_date_slot" }
+    );
+    await bookings.createIndex(
+      { userId: 1, date: 1, timeSlot: 1 },
+      { unique: true, partialFilterExpression: activeOnly, name: "uniq_user_date_slot" }
+    );
+    await bookings.createIndex({ userId: 1, date: 1, timeSlot: 1 });
+    await bookings.createIndex({ studioId: 1, date: 1 });
+  } catch (error) {
+    console.warn("Booking index creation failed:", error.message);
+  }
+}
 
 async function connectToMongoDB() {
   if (mongoReady) return mongoReady;
   mongoReady = (async () => {
     try {
       await client.connect();
+      await client.db(dbName).command({ ping: 1 });
       const db = client.db(dbName);
+      app.locals.db = db;
       app.locals.usersCollection = db.collection("users");
       app.locals.bookingsCollection = db.collection("bookings");
       app.locals.studiosCollection = db.collection("studios");
       app.locals.wishlistCollection = db.collection("wishlist");
 
-      // Indexes are idempotent but each is an extra Atlas round-trip on a
-      // cold start. Create them in the background (not awaited) so the first
-      // request waits only for the connection, not for index maintenance.
-      // MongoDB partial indexes do not support $ne; match the active
-      // statuses explicitly so the unique index can be created.
-      const activeOnly = { status: { $in: ["Pending", "Confirmed"] } };
-      void (async () => {
-        try {
-          await app.locals.wishlistCollection.createIndex(
-            { userId: 1, studioId: 1 },
-            { unique: true, name: "uniq_user_studio" }
-          );
-        } catch (indexError) {
-          console.warn("Wishlist index creation failed:", indexError.message);
-        }
-        try {
-          await app.locals.bookingsCollection.createIndex(
-            { studioId: 1, date: 1, timeSlot: 1 },
-            { unique: true, partialFilterExpression: activeOnly, name: "uniq_studio_date_slot" }
-          );
-          await app.locals.bookingsCollection.createIndex(
-            { userId: 1, date: 1, timeSlot: 1 },
-            { unique: true, partialFilterExpression: activeOnly, name: "uniq_user_date_slot" }
-          );
-        } catch (indexError) {
-          console.warn("Booking index creation failed:", indexError.message);
-        }
-      })();
-
+      // Background index maintenance to keep cold starts fast.
+      void ensureIndexes(db);
       console.log(`Successfully connected to MongoDB (db "${dbName}")!`);
       return true;
     } catch (error) {
       mongoReady = null;
-      console.error("MongoDB connection failed:", error.message);
+      logMongoConnectionFailure(error, "startup/connect");
       throw error;
     }
   })();
   return mongoReady;
 }
 
-// Ensure a request never runs before collections exist (e.g. a cold request
-// on Vercel before the boot connect finishes, or a transient DB failure).
+// Ensure a request never runs before collections exist.
 app.use(async (req, res, next) => {
   if (!app.locals.bookingsCollection || !app.locals.studiosCollection) {
     try {
@@ -111,8 +160,7 @@ app.use(async (req, res, next) => {
   return next();
 });
 
-// Health + root endpoints for deploy checks (Render / Vercel / uptime).
-app.get("/api/health", async (req, res) => {
+app.get("/api/health", async (_req, res) => {
   try {
     await client.db(dbName).command({ ping: 1 });
     return res.status(200).json({
@@ -121,14 +169,14 @@ app.get("/api/health", async (req, res) => {
       db: dbName,
       time: new Date().toISOString(),
     });
-  } catch (error) {
+  } catch {
     return res
       .status(503)
-      .json({ success: false, status: "degraded", error: error.message });
+      .json({ success: false, status: "degraded" });
   }
 });
 
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   return res.status(200).json({
     success: true,
     service: "StudioSpace API",
@@ -140,120 +188,145 @@ app.get("/", (req, res) => {
 app.use("/api/bookings", bookingRoutes);
 app.use("/api/wishlist", wishlistRoutes);
 
-app.get("/api/studios/featured", async (req, res) => {
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const studioCreateSchema = z.object({
+  title: z.string().trim().min(1).max(200),
+  category: z.string().trim().min(1).max(100),
+  location: z.string().trim().min(1).max(200),
+  description: z.string().trim().max(5000).optional().default(""),
+  hourlyRate: z.coerce.number().positive().max(100000),
+  image: z
+    .string()
+    .trim()
+    .url()
+    .refine((v) => /^https?:\/\//i.test(v), "image must be http(s)")
+    .optional()
+    .or(z.literal("").transform(() => undefined)),
+  amenities: z.array(z.string().trim().max(100)).max(50).optional(),
+  capacity: z.coerce.number().int().positive().max(10000).optional(),
+});
+
+const studioUpdateSchema = studioCreateSchema.partial();
+
+app.get("/api/studios/featured", async (_req, res) => {
   try {
-    const studiosCollection = client.db(dbName).collection("studios");
-    const studios = await studiosCollection
+    const studios = await reqSafeStudios(res, app);
+    if (!studios) return;
+    const result = await studios
       .find({})
       .sort({ createdAt: -1 })
       .limit(6)
       .toArray();
-    res.status(200).json(studios);
-  } catch (error) {
-    res.status(500).json({ message: "Failed to fetch featured studios" });
+    return res.status(200).json(result);
+  } catch {
+    return res.status(500).json({ message: "Failed to fetch featured studios" });
   }
 });
 
+function reqSafeStudios(res, appRef) {
+  const studios = appRef.locals.studiosCollection;
+  if (!studios) {
+    res.status(503).json({ success: false, message: "Database unavailable" });
+    return null;
+  }
+  return studios;
+}
+
+// Backward-compatible endpoint; session identity is authoritative.
 app.get("/api/studios/user/:email", verifyAuth, async (req, res) => {
   try {
-    const email = decodeURIComponent(req.params.email);
-
-    // Only the authenticated user may list their own studios.
+    const email = decodeURIComponent(req.params.email || "");
     if (email.toLowerCase() !== req.user.email.toLowerCase()) {
       return res.status(403).json({
         success: false,
         message: "Forbidden: cannot access another user's listings",
       });
     }
-
-    const studiosCollection = client.db(dbName).collection("studios");
-    const studios = await studiosCollection.find({ ownerEmail: email }).toArray();
-    res.status(200).json(studios);
-  } catch (error) {
-    res.status(500).json({ message: "Failed to fetch user listings" });
+    const studios = app.locals.studiosCollection;
+    const result = await studios
+      .find({ ownerEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+    return res.status(200).json(result);
+  } catch {
+    return res.status(500).json({ message: "Failed to fetch user listings" });
   }
 });
 
-app.get("/api/categories", async (req, res) => {
+// Preferred session-derived endpoint (avoids email-in-path scoping).
+app.get("/api/studios/mine", verifyAuth, async (req, res) => {
   try {
-    const studiosCollection = client.db(dbName).collection("studios");
-    const categories = await studiosCollection.distinct("category");
-    res.status(200).json(categories);
-  } catch (error) {
-    res.status(500).json({ message: "Failed to fetch categories" });
+    const studios = app.locals.studiosCollection;
+    const result = await studios
+      .find({ ownerEmail: req.user.email })
+      .sort({ createdAt: -1 })
+      .toArray();
+    return res.status(200).json(result);
+  } catch {
+    return res.status(500).json({ message: "Failed to fetch user listings" });
+  }
+});
+
+app.get("/api/categories", async (_req, res) => {
+  try {
+    const studios = app.locals.studiosCollection;
+    const categories = await studios.distinct("category");
+    return res.status(200).json(categories.filter(Boolean));
+  } catch {
+    return res.status(500).json({ message: "Failed to fetch categories" });
   }
 });
 
 app.get("/api/studios", async (req, res) => {
   try {
     const { category } = req.query;
-    let query = {};
-    if (category) {
-      query.category = { $regex: new RegExp(`^${category}$`, "i") };
+    const query = {};
+    if (typeof category === "string" && category.trim()) {
+      const safe = escapeRegex(category.trim().slice(0, 100));
+      query.category = { $regex: new RegExp(`^${safe}$`, "i") };
     }
-    const studiosCollection = client.db(dbName).collection("studios");
-    const studios = await studiosCollection.find(query).toArray();
-    res.status(200).json(studios);
-  } catch (error) {
-    res.status(500).json({ message: "Failed to fetch studios" });
+    const studios = app.locals.studiosCollection;
+    const result = await studios.find(query).sort({ createdAt: -1 }).toArray();
+    return res.status(200).json(result);
+  } catch {
+    return res.status(500).json({ message: "Failed to fetch studios" });
   }
 });
 
-app.post("/api/studios", verifyAuth, async (req, res) => {
+app.post("/api/studios", csrfAndOriginProtection, verifyAuth, async (req, res) => {
   try {
-    // Never trust ownership or identity fields supplied by the client.
-    const { ownerEmail, _id, createdAt, ...studioData } = req.body || {};
-    // Minimal validation so bad payloads get a 400 instead of polluting the DB.
-    if (
-      !studioData.title ||
-      !studioData.category ||
-      !studioData.location ||
-      studioData.hourlyRate == null ||
-      Number(studioData.hourlyRate) <= 0
-    ) {
+    const parsed = studioCreateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
       return res.status(400).json({
         success: false,
-        message:
-          "title, category, location and a positive hourlyRate are required",
+        message: "Invalid studio data",
+        errors: parsed.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
       });
     }
-    // Image must be a real http(s) URL — never store blob: URLs or huge
-    // data: payloads (the frontend validates the same rules).
-    if (studioData.image != null) {
-      const imageValue = String(studioData.image).trim();
-      let imageOk = false;
-      try {
-        const parsed = new URL(imageValue);
-        imageOk = parsed.protocol === "https:" || parsed.protocol === "http:";
-      } catch {
-        imageOk = false;
-      }
-      if (!imageOk) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "image must be a valid http(s) URL (blob: and data: URLs are not allowed)",
-        });
-      }
-      studioData.image = imageValue;
-    }
-    const studiosCollection = client.db(dbName).collection("studios");
 
-    const result = await studiosCollection.insertOne({
+    const studioData = parsed.data;
+    const studios = app.locals.studiosCollection;
+    const doc = {
       ...studioData,
       ownerEmail: req.user.email,
+      ownerId: req.user.id,
       createdAt: new Date(),
-    });
+      updatedAt: new Date(),
+    };
 
-    res.status(201).json({
+    const result = await studios.insertOne(doc);
+    return res.status(201).json({
       success: true,
       message: "Studio listed successfully!",
       insertedId: result.insertedId,
-      studioData: { ...studioData, ownerEmail: req.user.email },
+      studioData: doc,
     });
   } catch (error) {
-    console.error("Add Studio Error:", error);
-    res.status(500).json({ success: false, message: "Failed to submit studio" });
+    console.error("Add Studio Error:", error.message);
+    return res.status(500).json({ success: false, message: "Failed to submit studio" });
   }
 });
 
@@ -261,34 +334,35 @@ app.get("/api/studios/:id", async (req, res) => {
   try {
     const id = req.params.id;
     if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ message: "Invalid studio ID format" });
+      return res.status(400).json({ success: false, message: "Invalid studio ID format" });
     }
-    const studiosCollection = client.db(dbName).collection("studios");
-    const studio = await studiosCollection.findOne({ _id: new ObjectId(id) });
+    const studios = app.locals.studiosCollection;
+    const studio = await studios.findOne({ _id: new ObjectId(id) });
     if (!studio) {
-      return res.status(404).json({ message: "Studio not found" });
+      return res.status(404).json({ success: false, message: "Studio not found" });
     }
-    res.status(200).json(studio);
-  } catch (error) {
-    res.status(500).json({ message: "Server error while fetching studio" });
+    return res.status(200).json(studio);
+  } catch {
+    return res.status(500).json({ success: false, message: "Server error while fetching studio" });
   }
 });
 
 async function findOwnStudio(req, res) {
-  const studiosCollection = client.db(dbName).collection("studios");
-  const studio = await studiosCollection.findOne({
-    _id: new ObjectId(req.params.id),
-  });
+  const studios = app.locals.studiosCollection;
+  const studio = await studios.findOne({ _id: new ObjectId(req.params.id) });
 
   if (!studio) {
     res.status(404).json({ success: false, message: "Studio not found" });
     return null;
   }
 
-  if (
-    !studio.ownerEmail ||
-    studio.ownerEmail.toLowerCase() !== req.user.email.toLowerCase()
-  ) {
+  // Prefer stable ownerId when present; fall back to ownerEmail for legacy docs.
+  const ownsById = studio.ownerId && String(studio.ownerId) === String(req.user.id);
+  const ownsByEmail =
+    studio.ownerEmail &&
+    String(studio.ownerEmail).toLowerCase() === String(req.user.email).toLowerCase();
+
+  if (!ownsById && !ownsByEmail) {
     res.status(403).json({
       success: false,
       message: "Forbidden: you do not own this studio",
@@ -296,96 +370,97 @@ async function findOwnStudio(req, res) {
     return null;
   }
 
-  return { studiosCollection, studio };
+  return { studios, studio };
 }
 
-app.put("/api/studios/:id", verifyAuth, async (req, res) => {
+app.put("/api/studios/:id", csrfAndOriginProtection, verifyAuth, async (req, res) => {
   try {
     const id = req.params.id;
     if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ message: "Invalid studio ID format" });
+      return res.status(400).json({ success: false, message: "Invalid studio ID format" });
     }
 
     const owned = await findOwnStudio(req, res);
     if (!owned) return;
+
+    const parsed = studioUpdateSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid studio update data",
+        errors: parsed.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
+      });
+    }
 
     // Never allow ownership or identity fields to be overwritten.
-    const { ownerEmail, _id, createdAt, ...updatedData } = req.body || {};
+    const { ownerEmail, ownerId, _id, createdAt, ...rest } = parsed.data;
+    void ownerEmail; void ownerId; void _id; void createdAt;
 
-    if (updatedData.image != null) {
-      const imageValue = String(updatedData.image).trim();
-      let imageOk = false;
-      try {
-        const parsed = new URL(imageValue);
-        imageOk = parsed.protocol === "https:" || parsed.protocol === "http:";
-      } catch {
-        imageOk = false;
-      }
-      if (!imageOk) {
-        return res.status(400).json({
-          success: false,
-          message:
-            "image must be a valid http(s) URL (blob: and data: URLs are not allowed)",
-        });
-      }
-      updatedData.image = imageValue;
+    if (Object.keys(rest).length === 0) {
+      return res.status(400).json({ success: false, message: "No valid fields to update" });
     }
 
-    await owned.studiosCollection.updateOne(
+    await owned.studios.updateOne(
       { _id: new ObjectId(id) },
-      { $set: updatedData }
+      { $set: { ...rest, updatedAt: new Date() } }
     );
 
-    res.status(200).json({ success: true, message: "Studio updated successfully!" });
-  } catch (error) {
-    res.status(500).json({ message: "Failed to update studio" });
+    return res.status(200).json({ success: true, message: "Studio updated successfully!" });
+  } catch {
+    return res.status(500).json({ success: false, message: "Failed to update studio" });
   }
 });
 
-app.delete("/api/studios/:id", verifyAuth, async (req, res) => {
+app.delete("/api/studios/:id", csrfAndOriginProtection, verifyAuth, async (req, res) => {
   try {
     const id = req.params.id;
     if (!ObjectId.isValid(id)) {
-      return res.status(400).json({ message: "Invalid studio ID format" });
+      return res.status(400).json({ success: false, message: "Invalid studio ID format" });
     }
 
     const owned = await findOwnStudio(req, res);
     if (!owned) return;
 
-    await owned.studiosCollection.deleteOne({ _id: new ObjectId(id) });
-    res.status(200).json({ success: true, message: "Studio deleted successfully!" });
-  } catch (error) {
-    res.status(500).json({ message: "Failed to delete studio" });
+    await owned.studios.deleteOne({ _id: new ObjectId(id) });
+    return res.status(200).json({ success: true, message: "Studio deleted successfully!" });
+  } catch {
+    return res.status(500).json({ success: false, message: "Failed to delete studio" });
   }
 });
 
-// JSON 404 for any unmatched API route so the frontend never gets HTML.
-app.use("/api", (req, res) => {
-  return res
-    .status(404)
-    .json({ success: false, message: "API route not found" });
+// JSON 404 for any unmatched API route.
+app.use("/api", (_req, res) => {
+  return res.status(404).json({ success: false, message: "API route not found" });
 });
 
-// Central JSON error handler (invalid JSON bodies, CORS errors, etc.).
-app.use((error, req, res, next) => {
-  if (error?.type === "entity.too.large" || error?.type === "entity.parse.failed") {
-    return res
-      .status(400)
-      .json({ success: false, message: "Invalid request body" });
+function isProd() {
+  return process.env.NODE_ENV === "production";
+}
+
+// Central JSON error handler.
+app.use((error, _req, res, _next) => {
+  if (error?.type === "entity.too.large") {
+    return res.status(413).json({ success: false, message: "Request body too large" });
+  }
+  if (error?.type === "entity.parse.failed") {
+    return res.status(400).json({ success: false, message: "Invalid request body" });
   }
   if (error?.message?.includes("not allowed by CORS")) {
-    return res
-      .status(403)
-      .json({ success: false, message: error.message });
+    return res.status(403).json({ success: false, message: "Not allowed by CORS" });
   }
-  console.error("Unhandled error:", error);
-  return res
-    .status(500)
-    .json({ success: false, message: "Internal server error" });
+  if (error?.code === "EBADCSRFTOKEN") {
+    return res.status(403).json({ success: false, message: "Invalid request" });
+  }
+
+  if (!isProd()) {
+    console.error("Unhandled error:", error);
+  } else {
+    console.error("Unhandled error:", error?.message || "internal error");
+  }
+
+  return res.status(500).json({ success: false, message: "Internal server error" });
 });
 
-// On Vercel (serverless) the platform imports `app` and never calls listen().
-// Locally / on Render / Railway we must listen after Mongo is ready.
 const isServerless = Boolean(process.env.VERCEL);
 if (!isServerless) {
   connectToMongoDB()
@@ -395,11 +470,14 @@ if (!isServerless) {
       });
     })
     .catch((error) => {
-      console.error("Failed to start server:", error.message);
+      console.error("Failed to start server due to MongoDB connection failure.");
+      console.error("Server startup aborted (Express not listening).");
+      if (process.env.NODE_ENV !== "production") {
+        console.error(`Failure summary: ${error?.name || "Error"}: ${error?.message || "unknown error"}`);
+      }
       process.exit(1);
     });
 } else {
-  // Warm the connection for the first serverless invocation.
   void connectToMongoDB().catch(() => undefined);
 }
 
